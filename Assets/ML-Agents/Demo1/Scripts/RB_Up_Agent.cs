@@ -32,6 +32,8 @@ public class RB_Up_Agent : Agent
     [SerializeField] private float stepPenalty = -0.001f;
     [SerializeField] private float convContactPenalty = -0.3f;
     [SerializeField] private int boxesPerEpisode = 10;
+    [SerializeField] private float minAllowedY = -30f;
+    [SerializeField] private float outOfMapPenalty = -1.0f;
 
     private bool isInConveyorPickupZone;
     private bool isInSmallTruckZone;
@@ -42,9 +44,20 @@ public class RB_Up_Agent : Agent
     private GameObject heldBoxObject;
     private Rigidbody heldBoxRb;
     private Collider currentPickupZoneCollider;
+    private Rigidbody agentRb;
+
+    public override void Initialize()
+    {
+        agentRb = GetComponent<Rigidbody>();
+    }
 
     public override void OnEpisodeBegin()
     {
+        if (agentRb == null)
+        {
+            agentRb = GetComponent<Rigidbody>();
+        }
+
         ClearAllBoxesInLevel();
 
         transform.position = agentSpawnPoint != null ? agentSpawnPoint.position : transform.position;
@@ -70,6 +83,11 @@ public class RB_Up_Agent : Agent
 
     public override void OnActionReceived(ActionBuffers actions)
     {
+        if (CheckOutOfMapAndRestart())
+        {
+            return;
+        }
+
         // Discrete action layout:
         // branch 0: Move X (0 stay, 1 left, 2 right)
         // branch 1: Move Z (0 stay, 1 backward, 2 forward)
@@ -88,12 +106,33 @@ public class RB_Up_Agent : Agent
         if (moveDir.sqrMagnitude > 0.0001f)
         {
             Vector3 normalizedMoveDir = moveDir.normalized;
-            transform.position += normalizedMoveDir * moveSpeed * Time.deltaTime;
+            Vector3 delta = normalizedMoveDir * moveSpeed * Time.fixedDeltaTime;
+            if (agentRb != null)
+            {
+                agentRb.MovePosition(agentRb.position + delta);
+            }
+            else
+            {
+                transform.position += delta;
+            }
 
             float targetZ = -Mathf.Atan2(normalizedMoveDir.x, normalizedMoveDir.z) * Mathf.Rad2Deg;
             Vector3 currentEuler = transform.eulerAngles;
             float newZ = Mathf.MoveTowardsAngle(currentEuler.z, targetZ, turnSpeed * Time.deltaTime);
-            transform.eulerAngles = new Vector3(currentEuler.x, currentEuler.y, newZ);
+            Vector3 nextEuler = new Vector3(currentEuler.x, currentEuler.y, newZ);
+            if (agentRb != null)
+            {
+                agentRb.MoveRotation(Quaternion.Euler(nextEuler));
+            }
+            else
+            {
+                transform.eulerAngles = nextEuler;
+            }
+        }
+
+        if (CheckOutOfMapAndRestart())
+        {
+            return;
         }
 
         if (interaction == 1)
@@ -193,6 +232,7 @@ public class RB_Up_Agent : Agent
             AddReward(wrongTruckPenalty);
         }
 
+        ConveyorSafetyUtil.UnregisterFromConveyors(heldBoxObject);
         Destroy(heldBoxObject);
         heldBoxObject = null;
         heldBoxRb = null;
@@ -209,6 +249,7 @@ public class RB_Up_Agent : Agent
     {
         if (heldBoxObject != null)
         {
+            ConveyorSafetyUtil.UnregisterFromConveyors(heldBoxObject);
             Destroy(heldBoxObject);
             heldBoxObject = null;
             heldBoxRb = null;
@@ -222,6 +263,7 @@ public class RB_Up_Agent : Agent
         {
             if (allBoxes[i] != null)
             {
+                ConveyorSafetyUtil.UnregisterFromConveyors(allBoxes[i].gameObject);
                 Destroy(allBoxes[i].gameObject);
             }
         }
@@ -329,5 +371,17 @@ public class RB_Up_Agent : Agent
         {     
             AddReward(convContactPenalty);
         }
+    }
+
+    private bool CheckOutOfMapAndRestart()
+    {
+        if (transform.position.y < minAllowedY)
+        {
+            AddReward(outOfMapPenalty);
+            EndEpisodeAndCleanup();
+            return true;
+        }
+
+        return false;
     }
 }

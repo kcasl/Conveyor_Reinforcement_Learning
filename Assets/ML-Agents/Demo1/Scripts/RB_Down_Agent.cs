@@ -8,6 +8,8 @@ public class RB_Down_Agent : Agent
     [Header("Movement")]
     [SerializeField] private float moveSpeed = 3f;
     [SerializeField] private float turnSpeed = 720f;
+    [SerializeField] private float movementSkinWidth = 0.02f;
+    [SerializeField] private LayerMask movementBlockMask = ~0;
     [SerializeField] private Transform agentSpawnPoint;
     [SerializeField] private Vector3 initialRotationEuler;
 
@@ -23,7 +25,6 @@ public class RB_Down_Agent : Agent
     [SerializeField] private string truckLoadZoneTag = "TruckLoadZone";
     [SerializeField] private string conveyorInputZoneTag = "ConveyorInputZone";
     [SerializeField] private string upAgentAreaTag = "UpArea";
-    [SerializeField] private string convTag = "Conv";
 
     [Header("Rewards")]
     [SerializeField] private float loadFromTruckReward = 0.2f;
@@ -33,9 +34,10 @@ public class RB_Down_Agent : Agent
     [SerializeField] private float invalidActionPenalty = -0.02f;
     [SerializeField] private float noConveyorPlacementPenalty = -1.0f;
     [SerializeField] private float stepPenalty = -0.001f;
-    [SerializeField] private float convContactPenalty = -0.3f;
     [SerializeField] private float enterUpAreaPenalty = -0.5f;
     [SerializeField] private float stayInUpAreaPenaltyPerStep = -0.01f;
+    [SerializeField] private float minAllowedY = -30f;
+    [SerializeField] private float outOfMapPenalty = -1.0f;
 
     private bool isInTruckLoadZone;
     private bool isInConveyorInputZone;
@@ -44,9 +46,20 @@ public class RB_Down_Agent : Agent
 
     private GameObject heldBoxObject;
     private Rigidbody heldBoxRb;
+    private Rigidbody agentRb;
+
+    public override void Initialize()
+    {
+        agentRb = GetComponent<Rigidbody>();
+    }
 
     public override void OnEpisodeBegin()
     {
+        if (agentRb == null)
+        {
+            agentRb = GetComponent<Rigidbody>();
+        }
+
         transform.position = agentSpawnPoint != null ? agentSpawnPoint.position : transform.position;
         transform.rotation = Quaternion.Euler(initialRotationEuler);
         isInTruckLoadZone = false;
@@ -66,6 +79,11 @@ public class RB_Down_Agent : Agent
 
     public override void OnActionReceived(ActionBuffers actions)
     {
+        if (CheckOutOfMapAndRestart())
+        {
+            return;
+        }
+
         // Discrete action layout:
         // branch 0: Move X (0 stay, 1 left, 2 right)
         // branch 1: Move Z (0 stay, 1 backward, 2 forward)
@@ -84,12 +102,35 @@ public class RB_Down_Agent : Agent
         if (moveDir.sqrMagnitude > 0.0001f)
         {
             Vector3 normalizedMoveDir = moveDir.normalized;
-            transform.position += normalizedMoveDir * moveSpeed * Time.deltaTime;
+            float moveDistance = moveSpeed * Time.fixedDeltaTime;
+            Vector3 delta = normalizedMoveDir * moveDistance;
+            if (agentRb != null)
+            {
+                Vector3 safeDelta = GetSafeMoveDelta(normalizedMoveDir, moveDistance);
+                agentRb.MovePosition(agentRb.position + safeDelta);
+            }
+            else
+            {
+                transform.position += delta;
+            }
 
             float targetZ = -Mathf.Atan2(normalizedMoveDir.x, normalizedMoveDir.z) * Mathf.Rad2Deg;
             Vector3 currentEuler = transform.eulerAngles;
             float newZ = Mathf.MoveTowardsAngle(currentEuler.z, targetZ, turnSpeed * Time.deltaTime);
-            transform.eulerAngles = new Vector3(currentEuler.x, currentEuler.y, newZ);
+            Vector3 nextEuler = new Vector3(currentEuler.x, currentEuler.y, newZ);
+            if (agentRb != null)
+            {
+                agentRb.MoveRotation(Quaternion.Euler(nextEuler));
+            }
+            else
+            {
+                transform.eulerAngles = nextEuler;
+            }
+        }
+
+        if (CheckOutOfMapAndRestart())
+        {
+            return;
         }
 
         if (interaction == 1)
@@ -187,6 +228,7 @@ public class RB_Down_Agent : Agent
     {
         if (heldBoxObject != null)
         {
+            ConveyorSafetyUtil.UnregisterFromConveyors(heldBoxObject);
             Destroy(heldBoxObject);
             heldBoxObject = null;
             heldBoxRb = null;
@@ -217,7 +259,6 @@ public class RB_Down_Agent : Agent
             AddReward(enterUpAreaPenalty);
         }
 
-        TryApplyConvContactPenalty(other);
     }
 
     private void OnTriggerExit(Collider other)
@@ -236,16 +277,36 @@ public class RB_Down_Agent : Agent
         }
     }
 
-    private void OnCollisionEnter(Collision collision)
+    private Vector3 GetSafeMoveDelta(Vector3 moveDirection, float moveDistance)
     {
-        TryApplyConvContactPenalty(collision.collider);
+        if (agentRb == null || moveDistance <= 0f)
+        {
+            return Vector3.zero;
+        }
+
+        // SweepTest prevents passing through colliders when moving fast.
+        if (agentRb.SweepTest(moveDirection, out RaycastHit hit, moveDistance + movementSkinWidth, QueryTriggerInteraction.Ignore))
+        {
+            bool blockedByMask = (movementBlockMask.value & (1 << hit.collider.gameObject.layer)) != 0;
+            if (blockedByMask)
+            {
+                float allowedDistance = Mathf.Max(0f, hit.distance - movementSkinWidth);
+                return moveDirection * allowedDistance;
+            }
+        }
+
+        return moveDirection * moveDistance;
     }
 
-    private void TryApplyConvContactPenalty(Component contact)
+    private bool CheckOutOfMapAndRestart()
     {
-        if (contact != null && contact.CompareTag(convTag))
+        if (transform.position.y < minAllowedY)
         {
-            AddReward(convContactPenalty);
+            AddReward(outOfMapPenalty);
+            EndEpisode();
+            return true;
         }
+
+        return false;
     }
 }
