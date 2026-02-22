@@ -7,9 +7,11 @@ public class RB_Down_Agent : Agent
 {
     [Header("Movement")]
     [SerializeField] private float moveSpeed = 3f;
-    [SerializeField] private float turnSpeed = 720f;
+    [SerializeField] private float turnSpeed = 540f;
+    [SerializeField] private Vector3 positionObservationScale = new Vector3(20f, 5f, 20f);
     [SerializeField] private float movementSkinWidth = 0.02f;
     [SerializeField] private LayerMask movementBlockMask = ~0;
+    [SerializeField] private bool enforcePlanarPhysics = true;
     [SerializeField] private Transform agentSpawnPoint;
     [SerializeField] private Vector3 initialRotationEuler;
 
@@ -34,23 +36,29 @@ public class RB_Down_Agent : Agent
     [SerializeField] private float invalidActionPenalty = -0.02f;
     [SerializeField] private float noConveyorPlacementPenalty = -1.0f;
     [SerializeField] private float stepPenalty = -0.001f;
-    [SerializeField] private float enterUpAreaPenalty = -0.5f;
-    [SerializeField] private float stayInUpAreaPenaltyPerStep = -0.01f;
+    [SerializeField] private float enterUpAreaPenalty = -1.0f;
+    [SerializeField] private float idleInConveyorWithoutBoxPenalty = -0.005f;
+    [SerializeField] private int conveyorIdleStepLimit = 120;
+    [SerializeField] private float conveyorIdleTimeoutPenalty = -0.5f;
     [SerializeField] private float minAllowedY = -30f;
     [SerializeField] private float outOfMapPenalty = -1.0f;
+    [SerializeField] private int maxBoxesPerEpisode = 20;
 
     private bool isInTruckLoadZone;
     private bool isInConveyorInputZone;
-    private bool isInUpAgentArea;
     private bool hasPlacedOnConveyor;
+    private int conveyorIdleSteps;
+    private int spawnedBoxCount;
 
     private GameObject heldBoxObject;
     private Rigidbody heldBoxRb;
     private Rigidbody agentRb;
+    private float fixedPlaneY;
 
     public override void Initialize()
     {
         agentRb = GetComponent<Rigidbody>();
+        ConfigureAgentPhysics();
     }
 
     public override void OnEpisodeBegin()
@@ -59,26 +67,61 @@ public class RB_Down_Agent : Agent
         {
             agentRb = GetComponent<Rigidbody>();
         }
+        ConfigureAgentPhysics();
+        if (heldBoxObject != null)
+        {
+            ClearHeldBox();
+        }
 
-        transform.position = agentSpawnPoint != null ? agentSpawnPoint.position : transform.position;
-        transform.rotation = Quaternion.Euler(initialRotationEuler);
+        Vector3 startPos = agentSpawnPoint != null ? agentSpawnPoint.position : transform.position;
+        fixedPlaneY = startPos.y;
+        if (agentRb != null)
+        {
+            agentRb.velocity = Vector3.zero;
+            agentRb.angularVelocity = Vector3.zero;
+            agentRb.position = startPos;
+            agentRb.rotation = Quaternion.Euler(initialRotationEuler);
+        }
+        else
+        {
+            transform.position = startPos;
+            transform.rotation = Quaternion.Euler(initialRotationEuler);
+        }
         isInTruckLoadZone = false;
         isInConveyorInputZone = false;
-        isInUpAgentArea = false;
         hasPlacedOnConveyor = false;
+        conveyorIdleSteps = 0;
+        spawnedBoxCount = 0;
         ClearHeldBox();
     }
 
     public override void CollectObservations(VectorSensor sensor)
     {
-        sensor.AddObservation(transform.localPosition);
+        Vector3 localPos = transform.localPosition;
+        float sx = Mathf.Max(0.0001f, Mathf.Abs(positionObservationScale.x));
+        float sy = Mathf.Max(0.0001f, Mathf.Abs(positionObservationScale.y));
+        float sz = Mathf.Max(0.0001f, Mathf.Abs(positionObservationScale.z));
+        sensor.AddObservation(Mathf.Clamp(localPos.x / sx, -1f, 1f));
+        sensor.AddObservation(Mathf.Clamp(localPos.y / sy, -1f, 1f));
+        sensor.AddObservation(Mathf.Clamp(localPos.z / sz, -1f, 1f));
         sensor.AddObservation(isInTruckLoadZone ? 1f : 0f);
         sensor.AddObservation(isInConveyorInputZone ? 1f : 0f);
         sensor.AddObservation(heldBoxObject != null ? 1f : 0f);
     }
 
+    public override void WriteDiscreteActionMask(IDiscreteActionMask actionMask)
+    {
+        if (IsInteractionLocked())
+        {
+            // branch 2: 0 none, 1 take from truck, 2 place on conveyor
+            actionMask.SetActionEnabled(2, 1, false);
+            actionMask.SetActionEnabled(2, 2, false);
+        }
+    }
+
     public override void OnActionReceived(ActionBuffers actions)
     {
+        MaintainPlanarMotion();
         if (CheckOutOfMapAndRestart())
         {
             return;
@@ -91,6 +134,11 @@ public class RB_Down_Agent : Agent
         int moveX = actions.DiscreteActions[0];
         int moveZ = actions.DiscreteActions[1];
         int interaction = actions.DiscreteActions[2];
+
+        if (IsInteractionLocked())
+        {
+            interaction = 0;
+        }
 
         Vector3 moveDir = Vector3.zero;
         if (moveX == 1) moveDir.x = -1f;
@@ -115,16 +163,16 @@ public class RB_Down_Agent : Agent
             }
 
             float targetZ = -Mathf.Atan2(normalizedMoveDir.x, normalizedMoveDir.z) * Mathf.Rad2Deg;
-            Vector3 currentEuler = transform.eulerAngles;
-            float newZ = Mathf.MoveTowardsAngle(currentEuler.z, targetZ, turnSpeed * Time.deltaTime);
-            Vector3 nextEuler = new Vector3(currentEuler.x, currentEuler.y, newZ);
+            Vector3 currentEuler = agentRb != null ? agentRb.rotation.eulerAngles : transform.rotation.eulerAngles;
+            float nextZ = Mathf.MoveTowardsAngle(currentEuler.z, targetZ, turnSpeed * Time.fixedDeltaTime);
+            Quaternion targetRotation = Quaternion.Euler(currentEuler.x, currentEuler.y, nextZ);
             if (agentRb != null)
             {
-                agentRb.MoveRotation(Quaternion.Euler(nextEuler));
+                agentRb.MoveRotation(targetRotation);
             }
             else
             {
-                transform.eulerAngles = nextEuler;
+                transform.rotation = targetRotation;
             }
         }
 
@@ -132,6 +180,7 @@ public class RB_Down_Agent : Agent
         {
             return;
         }
+        MaintainPlanarMotion();
 
         if (interaction == 1)
         {
@@ -143,15 +192,34 @@ public class RB_Down_Agent : Agent
         }
 
         AddReward(stepPenalty);
-        if (isInUpAgentArea)
+
+        if (isInConveyorInputZone && heldBoxObject == null)
         {
-            AddReward(stayInUpAreaPenaltyPerStep);
+            AddReward(idleInConveyorWithoutBoxPenalty);
+            conveyorIdleSteps++;
+            if (conveyorIdleSteps >= conveyorIdleStepLimit)
+            {
+                AddReward(conveyorIdleTimeoutPenalty);
+                EndEpisode();
+                return;
+            }
+        }
+        else
+        {
+            conveyorIdleSteps = 0;
         }
 
-        if (StepCount >= MaxStep - 1 && !hasPlacedOnConveyor)
+        if (MaxStep > 0 && StepCount >= MaxStep - 1 && !hasPlacedOnConveyor)
         {
             AddReward(noConveyorPlacementPenalty);
         }
+    }
+
+    private bool IsInteractionLocked()
+    {
+        // After spawn limit is reached, block interactions until episode ends.
+        // Keep place action available only while currently holding the last box.
+        return spawnedBoxCount >= maxBoxesPerEpisode && heldBoxObject == null;
     }
 
     public override void Heuristic(in ActionBuffers actionsOut)
@@ -173,7 +241,7 @@ public class RB_Down_Agent : Agent
 
     private void TryTakeRandomBoxFromTruck()
     {
-        if (!isInTruckLoadZone || heldBoxObject != null)
+        if (!isInTruckLoadZone || heldBoxObject != null || spawnedBoxCount >= maxBoxesPerEpisode)
         {
             AddReward(invalidActionPenalty);
             return;
@@ -196,12 +264,16 @@ public class RB_Down_Agent : Agent
 
         heldBoxObject.transform.SetParent(holdPoint);
         heldBoxObject.transform.localPosition = Vector3.zero;
+        spawnedBoxCount++;
+        conveyorIdleSteps = 0;
         AddReward(loadFromTruckReward);
     }
 
     private void TryPlaceBoxOnConveyor()
     {
-        if (!isInConveyorInputZone || heldBoxObject == null || conveyorDropPoint == null)
+        bool canPlaceOnConveyor = conveyorDropPoint != null && heldBoxObject != null;
+
+        if (!canPlaceOnConveyor)
         {
             AddReward(invalidActionPenalty);
             return;
@@ -221,7 +293,6 @@ public class RB_Down_Agent : Agent
         hasPlacedOnConveyor = true;
 
         AddReward(placeOnConveyorReward);
-        EndEpisode();
     }
 
     private void ClearHeldBox()
@@ -237,44 +308,12 @@ public class RB_Down_Agent : Agent
 
     private void OnTriggerEnter(Collider other)
     {
-        if (other.CompareTag(truckLoadZoneTag))
-        {
-            isInTruckLoadZone = true;
-            if (heldBoxObject == null)
-            {
-                AddReward(enterTruckZoneReward);
-            }
-        }
-        else if (other.CompareTag(conveyorInputZoneTag))
-        {
-            isInConveyorInputZone = true;
-            if (heldBoxObject != null)
-            {
-                AddReward(enterConveyorZoneWithBoxReward);
-            }
-        }
-        else if (other.CompareTag(upAgentAreaTag))
-        {
-            isInUpAgentArea = true;
-            AddReward(enterUpAreaPenalty);
-        }
-
+        HandleZoneEnter(other);
     }
 
     private void OnTriggerExit(Collider other)
     {
-        if (other.CompareTag(truckLoadZoneTag))
-        {
-            isInTruckLoadZone = false;
-        }
-        else if (other.CompareTag(conveyorInputZoneTag))
-        {
-            isInConveyorInputZone = false;
-        }
-        else if (other.CompareTag(upAgentAreaTag))
-        {
-            isInUpAgentArea = false;
-        }
+        HandleZoneExit(other);
     }
 
     private Vector3 GetSafeMoveDelta(Vector3 moveDirection, float moveDistance)
@@ -309,4 +348,83 @@ public class RB_Down_Agent : Agent
 
         return false;
     }
+
+    private void ConfigureAgentPhysics()
+    {
+        if (agentRb == null || !enforcePlanarPhysics)
+        {
+            return;
+        }
+
+        agentRb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+        agentRb.interpolation = RigidbodyInterpolation.Interpolate;
+        agentRb.constraints = RigidbodyConstraints.FreezePositionY
+                            | RigidbodyConstraints.FreezeRotationX
+                            | RigidbodyConstraints.FreezeRotationY;
+    }
+
+    private void MaintainPlanarMotion()
+    {
+        if (agentRb == null || !enforcePlanarPhysics)
+        {
+            return;
+        }
+
+        Vector3 velocity = agentRb.velocity;
+        velocity.y = 0f;
+        agentRb.velocity = velocity;
+
+        Vector3 position = agentRb.position;
+        position.y = fixedPlaneY;
+        agentRb.position = position;
+    }
+
+    private void HandleZoneEnter(Collider other)
+    {
+        if (other == null)
+        {
+            return;
+        }
+
+        if (other.CompareTag(truckLoadZoneTag))
+        {
+            isInTruckLoadZone = true;
+            if (heldBoxObject == null)
+            {
+                AddReward(enterTruckZoneReward);
+            }
+        }
+        else if (other.CompareTag(conveyorInputZoneTag))
+        {
+            isInConveyorInputZone = true;
+            if (heldBoxObject != null)
+            {
+                AddReward(enterConveyorZoneWithBoxReward);
+            }
+        }
+        else if (other.CompareTag(upAgentAreaTag))
+        {
+            AddReward(enterUpAreaPenalty);
+            EndEpisode();
+        }
+    }
+
+    private void HandleZoneExit(Collider other)
+    {
+        if (other == null)
+        {
+            return;
+        }
+
+        if (other.CompareTag(truckLoadZoneTag))
+        {
+            isInTruckLoadZone = false;
+        }
+        else if (other.CompareTag(conveyorInputZoneTag))
+        {
+            isInConveyorInputZone = false;
+            conveyorIdleSteps = 0;
+        }
+    }
+
 }
